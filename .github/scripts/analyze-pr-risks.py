@@ -59,19 +59,44 @@ class PRRiskAnalyzer:
             print(f"❌ Error fetching PRs: {e}")
             return []
 
-    def analyze_pr_security(self, pr: Dict) -> Dict:
+    def get_pr_detail(self, pr_number: int) -> Dict:
+        """
+        Fetch the full PR object from the Pulls API.
+
+        IMPORTANT: The Search API item's own 'url' field points to the
+        *issues* endpoint (/repos/.../issues/{number}), which does NOT
+        support /reviews or /files sub-resources - only /pulls/{number}
+        does. Always build pulls URLs from the repo + PR number directly
+        rather than reusing 'pr[\"url\"]' from a search result.
+        """
+        url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️  Could not fetch PR detail for #{pr_number}: {e}")
+            return {}
+
+    def analyze_pr_security(self, pr: Dict) -> List[Dict]:
         """Analyze security-related risks in a PR"""
         security_risks = []
+        pr_number = pr['number']
 
-        # Fetch full PR details
+        # Build correct Pulls-API URLs (never reuse pr['url'] from search results)
+        pulls_url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}"
+        reviews_url = f"{pulls_url}/reviews"
+        files_url = f"{pulls_url}/files"
+        comments_url = f"{self.base_url}/repos/{self.repo}/issues/{pr_number}/comments"
+
         try:
-            pr_url = pr['url']
-            pr_detail = requests.get(pr_url, headers=self.headers, timeout=10).json()
-
             # Check: Number of reviewers
-            reviews_url = f"{pr_url}/reviews"
-            reviews = requests.get(reviews_url, headers=self.headers, timeout=10).json()
-            approvals = [r for r in reviews if r['state'] == 'APPROVED']
+            reviews_response = requests.get(reviews_url, headers=self.headers, timeout=10)
+            reviews = reviews_response.json() if reviews_response.status_code == 200 else []
+            if not isinstance(reviews, list):
+                reviews = []
+
+            approvals = [r for r in reviews if isinstance(r, dict) and r.get('state') == 'APPROVED']
 
             if len(approvals) < self.min_reviewers:
                 security_risks.append({
@@ -80,56 +105,6 @@ class PRRiskAnalyzer:
                     'message': f'Only {len(approvals)} approval(s) - requires {self.min_reviewers} minimum'
                 })
 
-            # Check: Merge method (should not be squash for audit trail)
-            if pr_detail.get('merge_commit_sha'):
-                # Merged successfully, check for comments about concerns
-                comments_url = f"{pr_url}/comments"
-                try:
-                    comments = requests.get(comments_url, headers=self.headers, timeout=10).json()
-                    negative_keywords = ['revert', 'error', 'bug', 'security', 'danger', 'risk']
-                    if any(keyword in str(comments).lower() for keyword in negative_keywords):
-                        security_risks.append({
-                            'type': 'concerning_comments',
-                            'severity': 'medium',
-                            'message': 'PR has concerning comments (error, bug, security, etc.)'
-                        })
-                except:
-                    pass
-
-            # Check: Files changed
-            files_url = f"{pr_url}/files"
-            files_response = requests.get(files_url, headers=self.headers, timeout=10)
-            if files_response.status_code == 200:
-                files = files_response.json()
-
-                # Large changeset
-                if len(files) > self.max_files_change:
-                    security_risks.append({
-                        'type': 'large_changeset',
-                        'severity': 'medium',
-                        'message': f'{len(files)} files changed - large PRs increase review risk'
-                    })
-
-                # Sensitive file changes
-                for file in files:
-                    filename = file.get('filename', '').lower()
-                    if any(pattern in filename for pattern in self.sensitive_patterns):
-                        security_risks.append({
-                            'type': 'sensitive_file_change',
-                            'severity': 'critical',
-                            'message': f'Sensitive file modified: {file["filename"]}'
-                        })
-
-                # Check for additions in sensitive files
-                if file.get('additions', 0) > 100:
-                    if any(pattern in filename for pattern in ['secret', 'password', 'token', 'key']):
-                        security_risks.append({
-                            'type': 'sensitive_data_addition',
-                            'severity': 'critical',
-                            'message': f'{file["filename"]}: Large data addition ({file["additions"]} lines)'
-                        })
-
-            # Check: Merged without approval
             if len(approvals) == 0:
                 security_risks.append({
                     'type': 'no_approval',
@@ -137,132 +112,163 @@ class PRRiskAnalyzer:
                     'message': 'PR merged without explicit approval'
                 })
 
+            # Check: issue comments for concerning keywords
+            try:
+                comments_response = requests.get(comments_url, headers=self.headers, timeout=10)
+                comments = comments_response.json() if comments_response.status_code == 200 else []
+                if isinstance(comments, list) and comments:
+                    negative_keywords = ['revert', 'error', 'bug', 'security', 'danger', 'risk']
+                    comment_text = " ".join(c.get('body', '') for c in comments if isinstance(c, dict)).lower()
+                    if any(keyword in comment_text for keyword in negative_keywords):
+                        security_risks.append({
+                            'type': 'concerning_comments',
+                            'severity': 'medium',
+                            'message': 'PR has concerning comments (error, bug, security, etc.)'
+                        })
+            except requests.exceptions.RequestException:
+                pass
+
+            # Check: Files changed
+            files_response = requests.get(files_url, headers=self.headers, timeout=10)
+            files = files_response.json() if files_response.status_code == 200 else []
+            if not isinstance(files, list):
+                files = []
+
+            if len(files) > self.max_files_change:
+                security_risks.append({
+                    'type': 'large_changeset',
+                    'severity': 'medium',
+                    'message': f'{len(files)} files changed - large PRs increase review risk'
+                })
+
+            for file in files:
+                if not isinstance(file, dict):
+                    continue
+                filename = file.get('filename', '').lower()
+
+                if any(pattern in filename for pattern in self.sensitive_patterns):
+                    security_risks.append({
+                        'type': 'sensitive_file_change',
+                        'severity': 'critical',
+                        'message': f'Sensitive file modified: {file["filename"]}'
+                    })
+
+                if file.get('additions', 0) > 100 and any(
+                    pattern in filename for pattern in ['secret', 'password', 'token', 'key']
+                ):
+                    security_risks.append({
+                        'type': 'sensitive_data_addition',
+                        'severity': 'critical',
+                        'message': f'{file["filename"]}: Large data addition ({file["additions"]} lines)'
+                    })
+
         except requests.exceptions.RequestException as e:
-            print(f"⚠️  Error analyzing security for PR #{pr.get('number')}: {e}")
+            print(f"⚠️  Error analyzing security for PR #{pr_number}: {e}")
 
         return security_risks
 
-    def analyze_pr_quality(self, pr: Dict) -> Dict:
+    def analyze_pr_quality(self, pr: Dict, pr_detail: Dict) -> List[Dict]:
         """Analyze code quality-related risks"""
         quality_risks = []
 
+        commit_sha = pr_detail.get('merge_commit_sha')
+        if not commit_sha:
+            return quality_risks
+
+        check_runs_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/check-runs"
         try:
-            pr_url = pr['url']
+            response = requests.get(check_runs_url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                checks = response.json().get('check_runs', [])
 
-            # Get the commit SHA
-            commit_sha = pr.get('merge_commit_sha')
-            if not commit_sha:
-                return quality_risks
+                for check in checks:
+                    if check.get('status') == 'completed':
+                        if check.get('conclusion') == 'failure':
+                            quality_risks.append({
+                                'type': 'check_failed',
+                                'severity': 'high',
+                                'message': f'Check failed: {check["name"]}'
+                            })
 
-            # Check for check runs (SonarQube, CodeQL, etc.)
-            check_runs_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/check-runs"
-            try:
-                response = requests.get(check_runs_url, headers=self.headers, timeout=10)
-                if response.status_code == 200:
-                    checks = response.json().get('check_runs', [])
+                        if 'sonar' in check.get('name', '').lower() and check.get('conclusion') != 'success':
+                            quality_risks.append({
+                                'type': 'sonar_quality_gate_failed',
+                                'severity': 'medium',
+                                'message': f'SonarQube quality gate not met: {check["name"]}'
+                            })
 
-                    for check in checks:
-                        if check['status'] == 'completed':
-                            # Failed checks
-                            if check['conclusion'] == 'failure':
-                                quality_risks.append({
-                                    'type': 'check_failed',
-                                    'severity': 'high',
-                                    'message': f'Check failed: {check["name"]}'
-                                })
+                        if 'coverage' in check.get('name', '').lower() and check.get('conclusion') == 'failure':
+                            quality_risks.append({
+                                'type': 'coverage_insufficient',
+                                'severity': 'medium',
+                                'message': 'Code coverage below threshold'
+                            })
+        except requests.exceptions.RequestException:
+            pass
 
-                            # Parse specific quality tool failures
-                            if 'sonar' in check['name'].lower():
-                                if check['conclusion'] != 'success':
-                                    quality_risks.append({
-                                        'type': 'sonar_quality_gate_failed',
-                                        'severity': 'medium',
-                                        'message': f'SonarQube quality gate not met: {check["name"]}'
-                                    })
-
-                            if 'coverage' in check['name'].lower() and check['conclusion'] == 'failure':
-                                quality_risks.append({
-                                    'type': 'coverage_insufficient',
-                                    'severity': 'medium',
-                                    'message': 'Code coverage below threshold'
-                                })
-            except:
-                pass
-
-            # Check for status checks (older API)
-            status_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/status"
-            try:
-                response = requests.get(status_url, headers=self.headers, timeout=10)
-                if response.status_code == 200:
-                    status = response.json()
-                    if status['state'] == 'failure':
-                        quality_risks.append({
-                            'type': 'commit_status_failed',
-                            'severity': 'high',
-                            'message': 'Commit status check failed but PR was merged'
-                        })
-            except:
-                pass
-
-        except Exception as e:
-            print(f"⚠️  Error analyzing quality for PR #{pr.get('number')}: {e}")
+        status_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/status"
+        try:
+            response = requests.get(status_url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                status = response.json()
+                if status.get('state') == 'failure':
+                    quality_risks.append({
+                        'type': 'commit_status_failed',
+                        'severity': 'high',
+                        'message': 'Commit status check failed but PR was merged'
+                    })
+        except requests.exceptions.RequestException:
+            pass
 
         return quality_risks
 
-    def analyze_pr_tests(self, pr: Dict) -> Dict:
+    def analyze_pr_tests(self, pr: Dict, pr_detail: Dict) -> List[Dict]:
         """Analyze test-related risks"""
         test_risks = []
 
+        commit_sha = pr_detail.get('merge_commit_sha')
+        if not commit_sha:
+            return test_risks
+
+        check_runs_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/check-runs"
         try:
-            commit_sha = pr.get('merge_commit_sha')
-            if not commit_sha:
-                return test_risks
+            response = requests.get(check_runs_url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                checks = response.json().get('check_runs', [])
 
-            # Get check runs for test information
-            check_runs_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/check-runs"
-            try:
-                response = requests.get(check_runs_url, headers=self.headers, timeout=10)
-                if response.status_code == 200:
-                    checks = response.json().get('check_runs', [])
-
-                    for check in checks:
-                        # Look for test-related checks
-                        if any(keyword in check['name'].lower() for keyword in ['test', 'unit', 'integration', 'build']):
-                            if check['status'] == 'completed':
-                                if check['conclusion'] == 'failure':
-                                    test_risks.append({
-                                        'type': 'test_failure',
-                                        'severity': 'critical',
-                                        'message': f'Tests failed but PR merged: {check["name"]}'
-                                    })
-                                elif check['conclusion'] == 'neutral':
-                                    test_risks.append({
-                                        'type': 'test_skipped',
-                                        'severity': 'medium',
-                                        'message': f'Tests skipped: {check["name"]}'
-                                    })
-            except:
-                pass
-
-            # Check statuses API for test results
-            status_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/status"
-            try:
-                response = requests.get(status_url, headers=self.headers, timeout=10)
-                if response.status_code == 200:
-                    status = response.json()
-                    for check in status.get('statuses', []):
-                        if 'test' in check['context'].lower():
-                            if check['state'] == 'failure':
+                for check in checks:
+                    name = check.get('name', '')
+                    if any(keyword in name.lower() for keyword in ['test', 'unit', 'integration', 'build']):
+                        if check.get('status') == 'completed':
+                            if check.get('conclusion') == 'failure':
                                 test_risks.append({
                                     'type': 'test_failure',
                                     'severity': 'critical',
-                                    'message': f'{check["context"]} failed'
+                                    'message': f'Tests failed but PR merged: {name}'
                                 })
-            except:
-                pass
+                            elif check.get('conclusion') == 'neutral':
+                                test_risks.append({
+                                    'type': 'test_skipped',
+                                    'severity': 'medium',
+                                    'message': f'Tests skipped: {name}'
+                                })
+        except requests.exceptions.RequestException:
+            pass
 
-        except Exception as e:
-            print(f"⚠️  Error analyzing tests for PR #{pr.get('number')}: {e}")
+        status_url = f"{self.base_url}/repos/{self.repo}/commits/{commit_sha}/status"
+        try:
+            response = requests.get(status_url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                status = response.json()
+                for check in status.get('statuses', []):
+                    if 'test' in check.get('context', '').lower() and check.get('state') == 'failure':
+                        test_risks.append({
+                            'type': 'test_failure',
+                            'severity': 'critical',
+                            'message': f'{check["context"]} failed'
+                        })
+        except requests.exceptions.RequestException:
+            pass
 
         return test_risks
 
@@ -279,12 +285,10 @@ class PRRiskAnalyzer:
         quality_weight = 0.35
         test_weight = 0.25
 
-        # Calculate component scores
-        security_score = min(len(security_risks) * 2, 10)  # Each risk worth 2 points
-        quality_score = min(len(quality_risks) * 1.5, 10)  # Each risk worth 1.5 points
-        test_score = min(len(test_risks) * 3, 10)  # Each test risk worth 3 points (highest priority)
+        security_score = min(len(security_risks) * 2, 10)
+        quality_score = min(len(quality_risks) * 1.5, 10)
+        test_score = min(len(test_risks) * 3, 10)
 
-        # Weight and sum
         overall = (
             security_score * security_weight +
             quality_score * quality_weight +
@@ -295,18 +299,26 @@ class PRRiskAnalyzer:
 
     def analyze_pr(self, pr: Dict) -> Dict:
         """Analyze a single PR for all risk types"""
+        pr_number = pr['number']
+
+        # Fetch the full PR object once via the Pulls API - this has merge_commit_sha,
+        # merged_at, body, etc. that the Search API result does not reliably include.
+        pr_detail = self.get_pr_detail(pr_number)
+
         security_risks = self.analyze_pr_security(pr)
-        quality_risks = self.analyze_pr_quality(pr)
-        test_risks = self.analyze_pr_tests(pr)
+        quality_risks = self.analyze_pr_quality(pr, pr_detail)
+        test_risks = self.analyze_pr_tests(pr, pr_detail)
 
         risk_score = self.calculate_risk_score(security_risks, quality_risks, test_risks)
 
+        merged_at = pr_detail.get('merged_at') or pr.get('closed_at')
+
         return {
-            'number': pr['number'],
+            'number': pr_number,
             'title': pr['title'],
-            'url': pr['html_url'],
+            'url': pr.get('html_url', pr_detail.get('html_url', '')),
             'author': pr['user']['login'],
-            'merged_at': pr['merged_at'],
+            'merged_at': merged_at,
             'security_risks': security_risks,
             'quality_risks': quality_risks,
             'test_risks': test_risks,
@@ -352,7 +364,6 @@ class PRRiskAnalyzer:
 
             risk_data = self.analyze_pr(pr)
 
-            # Count risk types
             for risk in risk_data['security_risks']:
                 all_risks_by_type[risk['type']] += 1
             for risk in risk_data['quality_risks']:
@@ -369,7 +380,6 @@ class PRRiskAnalyzer:
             else:
                 print(f"✓ OK ({risk_data['overall_score']})")
 
-        # Generate summary
         report = {
             'timestamp': datetime.now().isoformat(),
             'repository': self.repo,
@@ -421,7 +431,6 @@ Examples:
     report = analyzer.generate_report()
     analyzer.save_report(report)
 
-    # Print summary
     print("\n" + "="*60)
     print("ANALYSIS COMPLETE")
     print("="*60)
