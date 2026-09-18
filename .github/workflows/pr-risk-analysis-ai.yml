@@ -82,6 +82,11 @@ jobs:
             --claude-token "${{ secrets.ANTHROPIC_API_KEY }}" \
             --days ${{ env.ANALYSIS_DAYS }}
 
+      # This step runs the visual card (PNG) + full Markdown summary report
+      # (dimensions table, services affected, key risks, PR list, PASS/FAIL
+      # verdict) directly into the Job Summary tab - see generate-release-
+      # risk-card.py's render_markdown_summary() / write_step_summary().
+
       - name: Upload release risk artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -89,12 +94,17 @@ jobs:
           name: release-risk-assessment
           path: |
             release-risk-report.json
+            release-risk-summary.md
             release-risk-card.png
             release-risk-card.html
           retention-days: 30
+          if-no-files-found: warn
 
       - name: Fail if release risk is critical
         if: failure()
         run: |
-          echo "❌ Release risk assessment failed or flagged CRITICAL risk - see the Job Summary and uploaded artifact for details"
+          echo "❌ Release risk assessment failed or flagged CRITICAL risk."
+          echo "Full summary report (card image + risk dimension table + key risks + PR list + PASS/FAIL verdict)"
+          echo "is available on the Job Summary tab above, and in the 'release-risk-assessment' artifact"
+          echo "(release-risk-summary.md, release-risk-report.json, release-risk-card.png)."
           exit 1

@@ -3,13 +3,19 @@
 Release Risk Card Generator
 
 Aggregates ALL PRs merged in a date range into ONE AI-analyzed
-"Release Risk Assessment" - rendered as a styled HTML card, screenshotted
-to PNG via headless Chromium (Playwright), and embedded into the
-GitHub Actions Job Summary.
+"Release Risk Assessment":
+  1. A styled HTML card, screenshotted to PNG via headless Chromium
+     (Playwright) and embedded into the GitHub Actions Job Summary.
+  2. A plain-Markdown text summary (searchable/accessible, unlike the
+     image) appended right after it, ending in a clear PASS/FAIL verdict.
+  3. A JSON report and the raw HTML/PNG saved to disk for the artifact
+     upload step.
 
-Why a screenshot instead of raw HTML/CSS in the summary: GitHub sanitizes
-Job Summary markdown and strips custom CSS / styled <div> layouts, so a
-polished, pixel-controlled card can only be delivered as an embedded image.
+Why a screenshot for the card: GitHub sanitizes Job Summary markdown and
+strips custom CSS / styled <div> layouts, so a polished, pixel-controlled
+card can only be delivered as an embedded image. The Markdown summary
+exists precisely to cover what the image can't: text search, screen
+readers, and diffability across runs.
 """
 
 import os
@@ -35,6 +41,16 @@ ALERT_STYLES = {
     "caution": {"bg": "#fee2e2", "border": "#fca5a5", "text": "#991b1b", "icon": "🔺"},
     "warning": {"bg": "#fef3c7", "border": "#fcd34d", "text": "#92400e", "icon": "⚠️"},
 }
+
+SEVERITY_EMOJI = {
+    "Critical": "🔴",
+    "High": "🟠",
+    "Medium": "🟡",
+    "Low": "🟢",
+}
+
+# The risk level at/above which the pipeline should fail
+FAIL_ON_LEVEL = "Critical"
 
 
 class ReleaseRiskAnalyzer:
@@ -286,18 +302,102 @@ def render_png(html: str, output_path: str):
         browser.close()
 
 
-def write_step_summary(png_path: str):
+def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict]) -> str:
+    """
+    Plain-text/Markdown companion to the PNG card - covers what an image
+    can't: full-text search, screen readers, and a clean diff between runs.
+    Uses GitHub's native alert syntax (rendered with colored borders/icons
+    by the Job Summary renderer) instead of custom HTML.
+    """
+    level = data.get('risk_level', 'Medium')
+    score = data.get('overall_score', 'N/A')
+    emoji = SEVERITY_EMOJI.get(level, '⚪')
+
+    lines = []
+    lines.append(f"## {emoji} Release Risk Assessment - Summary Report\n")
+    lines.append(f"**Overall Score:** {score}/10  ")
+    lines.append(f"**Risk Level:** {level}  ")
+    lines.append(f"**Repository:** {repo}  ")
+    lines.append(f"**PRs Assessed:** {len(prs)} (merged in the last {days} day(s))  ")
+    lines.append(f"**Generated:** {datetime.now().isoformat(timespec='seconds')}\n")
+
+    lines.append(f"### Summary\n\n{data.get('summary', 'N/A')}\n")
+
+    dims = data.get('risk_dimensions', [])
+    if dims:
+        lines.append("### Risk Dimensions\n")
+        lines.append("| Dimension | Severity | Score | Details |")
+        lines.append("|---|---|---|---|")
+        for d in dims:
+            dlevel = d.get('severity_label', 'Medium')
+            demoji = SEVERITY_EMOJI.get(dlevel, '⚪')
+            desc = (d.get('description') or '').replace('|', '\\|').replace('\n', ' ')
+            lines.append(f"| {d.get('name','')} | {demoji} {dlevel} | {d.get('score','?')}/10 | {desc} |")
+        lines.append("")
+
+        # Call out any alerts using GitHub's native alert blocks
+        for d in dims:
+            alert = d.get('alert')
+            if alert:
+                gh_type = "CAUTION" if alert.get('type') == 'caution' else "WARNING"
+                lines.append(f"> [!{gh_type}]")
+                lines.append(f"> **{d.get('name','')}:** {alert.get('text','')}\n")
+
+    services = data.get('services_affected', [])
+    if services:
+        lines.append("### Services Affected\n")
+        for s in services:
+            lines.append(f"- **{s.get('name','')}** ({s.get('detail','')})")
+        lines.append("")
+
+    risks = data.get('key_risks', [])
+    if risks:
+        lines.append("### Key Risks Identified\n")
+        for r in risks:
+            lines.append(f"- ⚠️ {r}")
+        lines.append("")
+
+    rollback = "✅ Yes" if data.get('rollback_plan_required') else "➖ Not required"
+    lines.append("### Deployment Guidance\n")
+    lines.append(f"- **Recommended Window:** {data.get('recommended_window', 'N/A')}")
+    lines.append(f"- **Rollback Plan Required:** {rollback}\n")
+
+    lines.append("### Pull Requests Included\n")
+    for pr in prs[:25]:
+        lines.append(f"- [#{pr['number']}]({pr.get('html_url','')}) {pr.get('title','')} (@{pr.get('user',{}).get('login','unknown')})")
+    if len(prs) > 25:
+        lines.append(f"- ... and {len(prs) - 25} more")
+    lines.append("")
+
+    # Final verdict - tied directly to the same gate that fails the job
+    lines.append("---\n")
+    if level == FAIL_ON_LEVEL:
+        lines.append(f"### ❌ Final Verdict: FAIL\n")
+        lines.append(f"Risk level **{level}** meets or exceeds the fail threshold (`{FAIL_ON_LEVEL}`). "
+                      f"This pipeline run has been marked as failed - review the risk dimensions above before proceeding.\n")
+    else:
+        lines.append(f"### ✅ Final Verdict: PASS\n")
+        lines.append(f"Risk level **{level}** is below the fail threshold (`{FAIL_ON_LEVEL}`). "
+                      f"No pipeline gate was triggered, but review any High/Medium items above as appropriate.\n")
+
+    return "\n".join(lines)
+
+
+def write_step_summary(png_path: str, markdown_summary: str):
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     with open(png_path, 'rb') as f:
         b64 = base64.b64encode(f.read()).decode('utf-8')
 
-    md = f"![Release Risk Assessment](data:image/png;base64,{b64})\n"
+    image_md = f"![Release Risk Assessment](data:image/png;base64,{b64})\n"
+
+    combined = image_md + "\n" + markdown_summary
 
     if summary_file:
         with open(summary_file, 'a') as f:
-            f.write(md)
+            f.write(combined)
     else:
-        print("(GITHUB_STEP_SUMMARY not set - image not written; run inside GitHub Actions)")
+        print("(GITHUB_STEP_SUMMARY not set - printing summary to stdout instead)")
+        print(markdown_summary)
 
 
 def main():
@@ -314,9 +414,19 @@ def main():
     if not prs:
         print(f"⚠️  No merged PRs found in the last {args.days} day(s) - nothing to assess.")
         summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+        no_pr_md = (
+            f"\n### Release Risk Assessment\n\n"
+            f"No PRs merged in the last {args.days} day(s). Nothing to assess.\n\n"
+            f"### ✅ Final Verdict: PASS\n\nNo changes to evaluate.\n"
+        )
         if summary_file:
             with open(summary_file, 'a') as f:
-                f.write(f"\n### Release Risk Assessment\n\nNo PRs merged in the last {args.days} day(s). Nothing to assess.\n")
+                f.write(no_pr_md)
+        # Also write a minimal report file so the artifact upload step doesn't fail
+        with open('release-risk-report.json', 'w') as f:
+            json.dump({"overall_score": 0, "risk_level": "Low", "summary": "No PRs merged in range."}, f, indent=2)
+        with open('release-risk-summary.md', 'w') as f:
+            f.write(no_pr_md)
         sys.exit(0)
 
     print(f"📊 Assessing {len(prs)} merged PR(s) as one release...")
@@ -330,18 +440,24 @@ def main():
         f.write(html)
 
     render_png(html, 'release-risk-card.png')
-    write_step_summary('release-risk-card.png')
+
+    markdown_summary = render_markdown_summary(data, args.repo, args.days, prs)
+    with open('release-risk-summary.md', 'w') as f:
+        f.write(markdown_summary)
+
+    write_step_summary('release-risk-card.png', markdown_summary)
 
     print(json.dumps(
         {'overall_score': data.get('overall_score'), 'risk_level': data.get('risk_level')},
         indent=2
     ))
 
-    # Gate the pipeline: fail on Critical release risk
-    if data.get('risk_level') == 'Critical':
-        print("❌ Release risk level is CRITICAL - failing pipeline")
+    # Gate the pipeline: fail when risk level meets/exceeds the threshold
+    if data.get('risk_level') == FAIL_ON_LEVEL:
+        print(f"❌ Release risk level is {FAIL_ON_LEVEL.upper()} - failing pipeline")
         sys.exit(1)
 
+    print("✅ Release risk within acceptable limits")
     sys.exit(0)
 
 
