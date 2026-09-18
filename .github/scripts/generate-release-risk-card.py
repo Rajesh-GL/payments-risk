@@ -16,6 +16,11 @@ strips custom CSS / styled <div> layouts, so a polished, pixel-controlled
 card can only be delivered as an embedded image. The Markdown summary
 exists precisely to cover what the image can't: text search, screen
 readers, and diffability across runs.
+
+Scope: changes under .github/ (workflows, CI scripts) are excluded from
+analysis - this pipeline's own maintenance commits shouldn't be scored as
+"release risk" alongside real application changes. A PR that touches ONLY
+.github/ files is skipped entirely and listed separately in the report.
 """
 
 import os
@@ -33,6 +38,9 @@ import anthropic
 # Claude API model ID. Kept as a constant so it's easy to bump when
 # Anthropic retires a snapshot - see https://platform.claude.com/docs/en/about-claude/model-deprecations
 CLAUDE_MODEL = "claude-sonnet-5"
+
+# Path prefix excluded from risk analysis - CI/CD pipeline config, not application code
+EXCLUDED_PATH_PREFIXES = (".github/",)
 
 SEVERITY_COLORS = {
     "Critical": {"main": "#7c3aed", "bg": "#f5f3ff", "text": "#6d28d9"},
@@ -57,6 +65,29 @@ SEVERITY_EMOJI = {
 FAIL_ON_LEVEL = "Critical"
 
 
+def is_excluded_path(filename: str) -> bool:
+    return any(filename.startswith(prefix) for prefix in EXCLUDED_PATH_PREFIXES)
+
+
+def filter_diff_exclude_paths(diff_text: str) -> str:
+    """
+    Remove per-file hunks for excluded paths from a unified diff produced
+    by GitHub's .diff endpoint. Each file's hunk starts with a line like:
+        diff --git a/<path> b/<path>
+    """
+    sections = re.split(r'(?=^diff --git )', diff_text, flags=re.MULTILINE)
+    kept = []
+    for section in sections:
+        if not section.strip():
+            continue
+        first_line = section.splitlines()[0]
+        m = re.match(r'^diff --git a/(\S+) b/(\S+)', first_line)
+        if m and (is_excluded_path(m.group(1)) or is_excluded_path(m.group(2))):
+            continue
+        kept.append(section)
+    return "".join(kept)
+
+
 class ReleaseRiskAnalyzer:
     def __init__(self, repo: str, github_token: str, claude_api_key: str, days: int = 7, max_prs: int = 15):
         self.repo = repo
@@ -69,6 +100,7 @@ class ReleaseRiskAnalyzer:
         self.days = days
         self.max_prs = max_prs
         self.date_from = datetime.now() - timedelta(days=days)
+        self.skipped_prs: List[Dict] = []  # PRs excluded for touching ONLY .github/
 
     def fetch_prs(self) -> List[Dict]:
         date_from_str = self.date_from.isoformat().split('T')[0]
@@ -83,19 +115,6 @@ class ReleaseRiskAnalyzer:
             print(f"❌ Error fetching PRs: {e}")
             return []
 
-    def get_pr_diff(self, pr_number: int, max_len: int = 2500) -> str:
-        try:
-            url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}"
-            r = requests.get(url, headers=self.github_headers, timeout=10)
-            r.raise_for_status()
-            diff_url = r.json()['diff_url']
-            d = requests.get(diff_url, headers=self.github_headers, timeout=10)
-            d.raise_for_status()
-            text = d.text
-            return text[:max_len] + ("\n... (truncated)" if len(text) > max_len else "")
-        except Exception as e:
-            return f"(could not fetch diff: {e})"
-
     def get_pr_files(self, pr_number: int) -> List[Dict]:
         try:
             url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}/files"
@@ -105,17 +124,52 @@ class ReleaseRiskAnalyzer:
         except Exception:
             return []
 
-    def build_context(self, prs: List[Dict]) -> str:
+    def get_pr_diff_raw(self, pr_number: int) -> str:
+        try:
+            url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}"
+            r = requests.get(url, headers=self.github_headers, timeout=10)
+            r.raise_for_status()
+            diff_url = r.json()['diff_url']
+            d = requests.get(diff_url, headers=self.github_headers, timeout=10)
+            d.raise_for_status()
+            return d.text
+        except Exception as e:
+            return f"(could not fetch diff: {e})"
+
+    def filter_relevant_prs(self, prs: List[Dict]) -> List[Dict]:
+        """
+        Split PRs into ones with at least one non-excluded file change
+        (kept for analysis) and ones that ONLY touched excluded paths
+        like .github/ (recorded in self.skipped_prs, shown separately).
+        """
+        relevant = []
+        self.skipped_prs = []
+        for pr in prs:
+            files = self.get_pr_files(pr['number'])
+            non_excluded = [f for f in files if not is_excluded_path(f.get('filename', ''))]
+            if non_excluded:
+                relevant.append(pr)
+            else:
+                self.skipped_prs.append(pr)
+        return relevant
+
+    def build_context(self, prs: List[Dict], max_len_per_pr: int = 2500) -> str:
         chunks = []
         for pr in prs[:self.max_prs]:
             number = pr['number']
             files = self.get_pr_files(number)
-            file_list = ", ".join(f['filename'] for f in files[:15])
-            diff = self.get_pr_diff(number)
+            relevant_files = [f for f in files if not is_excluded_path(f.get('filename', ''))]
+            file_list = ", ".join(f['filename'] for f in relevant_files[:15])
+
+            raw_diff = self.get_pr_diff_raw(number)
+            diff = filter_diff_exclude_paths(raw_diff)
+            if len(diff) > max_len_per_pr:
+                diff = diff[:max_len_per_pr] + "\n... (truncated)"
+
             chunks.append(
                 f"### PR #{number}: {pr['title']}\n"
                 f"Author: {pr['user']['login']}\n"
-                f"Files changed ({len(files)}): {file_list}\n"
+                f"Files changed ({len(relevant_files)}, excluding .github/): {file_list}\n"
                 f"Diff:\n```\n{diff}\n```\n"
             )
         return "\n\n".join(chunks)
@@ -127,6 +181,10 @@ class ReleaseRiskAnalyzer:
 You are a senior release engineer and security reviewer. Assess the combined
 risk of shipping a release that bundles the following {len(prs)} merged pull
 requests as ONE cohesive change set.
+
+Note: changes under .github/ (CI/CD pipeline config) have already been
+excluded from the diffs below - only application/business code changes
+are shown. Do not comment on pipeline or workflow files.
 
 {context}
 
@@ -285,7 +343,7 @@ def render_html(data: Dict, repo: str, days: int) -> str:
     </div>
 
     <div style="margin-top:20px;padding-top:12px;border-top:1px dashed #e5e7eb;font-size:11px;color:#9ca3af;text-align:center;">
-      {repo} &middot; merged PRs from last {days} day(s) &middot; generated by Claude AI
+      {repo} &middot; merged PRs from last {days} day(s), excluding .github/ &middot; generated by Claude AI
     </div>
   </div>
 </body></html>
@@ -306,7 +364,7 @@ def render_png(html: str, output_path: str):
         browser.close()
 
 
-def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict]) -> str:
+def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict], skipped_prs: List[Dict]) -> str:
     """
     Plain-text/Markdown companion to the PNG card - covers what an image
     can't: full-text search, screen readers, and a clean diff between runs.
@@ -322,7 +380,7 @@ def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict]) -
     lines.append(f"**Overall Score:** {score}/10  ")
     lines.append(f"**Risk Level:** {level}  ")
     lines.append(f"**Repository:** {repo}  ")
-    lines.append(f"**PRs Assessed:** {len(prs)} (merged in the last {days} day(s))  ")
+    lines.append(f"**PRs Assessed:** {len(prs)} (merged in the last {days} day(s), excluding .github/-only changes)  ")
     lines.append(f"**Generated:** {datetime.now().isoformat(timespec='seconds')}\n")
 
     lines.append(f"### Summary\n\n{data.get('summary', 'N/A')}\n")
@@ -339,7 +397,6 @@ def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict]) -
             lines.append(f"| {d.get('name','')} | {demoji} {dlevel} | {d.get('score','?')}/10 | {desc} |")
         lines.append("")
 
-        # Call out any alerts using GitHub's native alert blocks
         for d in dims:
             alert = d.get('alert')
             if alert:
@@ -373,7 +430,14 @@ def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict]) -
         lines.append(f"- ... and {len(prs) - 25} more")
     lines.append("")
 
-    # Final verdict - tied directly to the same gate that fails the job
+    if skipped_prs:
+        lines.append("### Excluded from Analysis (only touched .github/)\n")
+        for pr in skipped_prs[:25]:
+            lines.append(f"- [#{pr['number']}]({pr.get('html_url','')}) {pr.get('title','')} (@{pr.get('user',{}).get('login','unknown')})")
+        if len(skipped_prs) > 25:
+            lines.append(f"- ... and {len(skipped_prs) - 25} more")
+        lines.append("")
+
     lines.append("---\n")
     if level == FAIL_ON_LEVEL:
         lines.append(f"### ❌ Final Verdict: FAIL\n")
@@ -393,7 +457,6 @@ def write_step_summary(png_path: str, markdown_summary: str):
         b64 = base64.b64encode(f.read()).decode('utf-8')
 
     image_md = f"![Release Risk Assessment](data:image/png;base64,{b64})\n"
-
     combined = image_md + "\n" + markdown_summary
 
     if summary_file:
@@ -402,6 +465,31 @@ def write_step_summary(png_path: str, markdown_summary: str):
     else:
         print("(GITHUB_STEP_SUMMARY not set - printing summary to stdout instead)")
         print(markdown_summary)
+
+
+def write_no_analysis_summary(reason: str, skipped_prs: List[Dict]):
+    """Used when there's nothing left to analyze after excluding .github/-only PRs."""
+    summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+    lines = [
+        "### Release Risk Assessment\n",
+        f"{reason}\n",
+    ]
+    if skipped_prs:
+        lines.append("Excluded (only touched .github/):\n")
+        for pr in skipped_prs[:25]:
+            lines.append(f"- [#{pr['number']}]({pr.get('html_url','')}) {pr.get('title','')}")
+        lines.append("")
+    lines.append("### ✅ Final Verdict: PASS\n\nNo application changes to evaluate.\n")
+    md = "\n".join(lines)
+
+    if summary_file:
+        with open(summary_file, 'a') as f:
+            f.write(md)
+
+    with open('release-risk-report.json', 'w') as f:
+        json.dump({"overall_score": 0, "risk_level": "Low", "summary": reason}, f, indent=2)
+    with open('release-risk-summary.md', 'w') as f:
+        f.write(md)
 
 
 def main():
@@ -413,28 +501,33 @@ def main():
     args = parser.parse_args()
 
     analyzer = ReleaseRiskAnalyzer(args.repo, args.github_token, args.claude_token, args.days)
-    prs = analyzer.fetch_prs()
+    all_prs = analyzer.fetch_prs()
 
-    if not prs:
-        print(f"⚠️  No merged PRs found in the last {args.days} day(s) - nothing to assess.")
-        summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
-        no_pr_md = (
-            f"\n### Release Risk Assessment\n\n"
-            f"No PRs merged in the last {args.days} day(s). Nothing to assess.\n\n"
-            f"### ✅ Final Verdict: PASS\n\nNo changes to evaluate.\n"
-        )
-        if summary_file:
-            with open(summary_file, 'a') as f:
-                f.write(no_pr_md)
-        # Also write a minimal report file so the artifact upload step doesn't fail
-        with open('release-risk-report.json', 'w') as f:
-            json.dump({"overall_score": 0, "risk_level": "Low", "summary": "No PRs merged in range."}, f, indent=2)
-        with open('release-risk-summary.md', 'w') as f:
-            f.write(no_pr_md)
+    if not all_prs:
+        reason = f"No PRs merged in the last {args.days} day(s). Nothing to assess."
+        print(f"⚠️  {reason}")
+        write_no_analysis_summary(reason, [])
         sys.exit(0)
 
-    print(f"📊 Assessing {len(prs)} merged PR(s) as one release...")
-    data = analyzer.analyze(prs)
+    print(f"🔎 Found {len(all_prs)} merged PR(s) - filtering out .github/-only changes...")
+    relevant_prs = analyzer.filter_relevant_prs(all_prs)
+
+    if analyzer.skipped_prs:
+        print(f"⏭️  Skipping {len(analyzer.skipped_prs)} PR(s) that only touched .github/:")
+        for pr in analyzer.skipped_prs:
+            print(f"    - #{pr['number']}: {pr['title']}")
+
+    if not relevant_prs:
+        reason = (
+            f"{len(all_prs)} PR(s) merged in the last {args.days} day(s), but all of them only touched "
+            f".github/ (pipeline config) - nothing else to assess."
+        )
+        print(f"⚠️  {reason}")
+        write_no_analysis_summary(reason, analyzer.skipped_prs)
+        sys.exit(0)
+
+    print(f"📊 Assessing {len(relevant_prs)} merged PR(s) as one release (excluding .github/)...")
+    data = analyzer.analyze(relevant_prs)
 
     with open('release-risk-report.json', 'w') as f:
         json.dump(data, f, indent=2)
@@ -445,7 +538,7 @@ def main():
 
     render_png(html, 'release-risk-card.png')
 
-    markdown_summary = render_markdown_summary(data, args.repo, args.days, prs)
+    markdown_summary = render_markdown_summary(data, args.repo, args.days, relevant_prs, analyzer.skipped_prs)
     with open('release-risk-summary.md', 'w') as f:
         f.write(markdown_summary)
 
@@ -456,7 +549,6 @@ def main():
         indent=2
     ))
 
-    # Gate the pipeline: fail when risk level meets/exceeds the threshold
     if data.get('risk_level') == FAIL_ON_LEVEL:
         print(f"❌ Release risk level is {FAIL_ON_LEVEL.upper()} - failing pipeline")
         sys.exit(1)
