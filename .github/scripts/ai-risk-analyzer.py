@@ -50,6 +50,36 @@ class AIRiskAnalyzer:
             print(f"❌ Error fetching PRs: {e}")
             return []
 
+    def get_pr_merged_at(self, pr: Dict) -> Optional[str]:
+        """
+        Safely extract the merged_at timestamp.
+
+        The Search API (/search/issues) does NOT include 'merged_at' directly
+        on the item - it's nested under 'pull_request', and even that isn't
+        guaranteed to be populated on every response. Fall back to fetching
+        the full PR object if needed, then to 'closed_at' as a last resort.
+        """
+        # Try the nested pull_request sub-object first (cheap, no extra call)
+        nested = pr.get('pull_request') or {}
+        if nested.get('merged_at'):
+            return nested['merged_at']
+
+        # Fall back to a direct API call for the full PR object
+        try:
+            pr_number = pr.get('number')
+            if pr_number:
+                url = f"{self.github_base_url}/repos/{self.repo}/pulls/{pr_number}"
+                response = requests.get(url, headers=self.github_headers, timeout=10)
+                if response.status_code == 200:
+                    detail = response.json()
+                    if detail.get('merged_at'):
+                        return detail['merged_at']
+        except requests.exceptions.RequestException:
+            pass
+
+        # Last resort - use closed_at (present on every issue/PR search result)
+        return pr.get('closed_at')
+
     def get_pr_diff(self, pr_number: int) -> Optional[str]:
         """Fetch the diff/patch for a PR"""
         try:
@@ -125,7 +155,7 @@ You are a security and code quality expert. Analyze this GitHub PR for potential
 - Author: {pr['user']['login']}
 - Number: {pr_number}
 - URL: {pr['html_url']}
-- Description: {pr.get('body', 'No description provided')[:500]}
+- Description: {(pr.get('body') or 'No description provided')[:500]}
 
 **Files Changed:**
 {file_summary}
@@ -178,7 +208,6 @@ Be specific and actionable. If no significant issues found, return empty ai_insi
 
             # Try to extract JSON from response
             try:
-                # Find JSON in the response
                 import re
                 json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
                 if json_match:
@@ -198,7 +227,7 @@ Be specific and actionable. If no significant issues found, return empty ai_insi
                     "confidence": 0.5
                 }
 
-            print(f"✓ ({ai_analysis['severity'].upper()})")
+            print(f"✓ ({ai_analysis.get('severity', 'unknown').upper()})")
             return ai_analysis
 
         except anthropic.APIError as e:
@@ -256,7 +285,6 @@ Be specific and actionable. If no significant issues found, return empty ai_insi
 
         for i, pr in enumerate(prs, 1):
             pr_number = pr['number']
-            title = pr['title'][:40]
 
             # AI analysis
             ai_analysis = self.analyze_pr_with_ai(pr)
@@ -267,7 +295,7 @@ Be specific and actionable. If no significant issues found, return empty ai_insi
                 'title': pr['title'],
                 'author': pr['user']['login'],
                 'url': pr['html_url'],
-                'merged_at': pr['merged_at'],
+                'merged_at': self.get_pr_merged_at(pr),
                 'ai_analysis': ai_analysis,
                 'ai_risk_score': round(ai_score, 1)
             }
