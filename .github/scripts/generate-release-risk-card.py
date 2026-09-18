@@ -30,6 +30,10 @@ from typing import List, Dict
 import requests
 import anthropic
 
+# Claude API model ID. Kept as a constant so it's easy to bump when
+# Anthropic retires a snapshot - see https://platform.claude.com/docs/en/about-claude/model-deprecations
+CLAUDE_MODEL = "claude-sonnet-5"
+
 SEVERITY_COLORS = {
     "Critical": {"main": "#7c3aed", "bg": "#f5f3ff", "text": "#6d28d9"},
     "High":     {"main": "#ef4444", "bg": "#fef2f2", "text": "#b91c1c"},
@@ -159,7 +163,7 @@ that would be hard to reverse.
 """
 
         message = self.claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model=CLAUDE_MODEL,
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
         )
