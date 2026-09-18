@@ -21,6 +21,13 @@ Scope: changes under .github/ (workflows, CI scripts) are excluded from
 analysis - this pipeline's own maintenance commits shouldn't be scored as
 "release risk" alongside real application changes. A PR that touches ONLY
 .github/ files is skipped entirely and listed separately in the report.
+
+Robustness: Claude is asked for a specific JSON schema, but LLM output is
+not guaranteed to match it exactly every time (e.g. it may return a list
+of plain strings where a list of {name, detail} objects was asked for).
+normalize_analysis() coerces whatever comes back into the expected shape
+immediately after parsing, so a minor schema deviation degrades gracefully
+instead of crashing the whole job deep inside HTML rendering.
 """
 
 import os
@@ -30,7 +37,7 @@ import base64
 import argparse
 import re
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Any
 
 import requests
 import anthropic
@@ -41,6 +48,8 @@ CLAUDE_MODEL = "claude-sonnet-5"
 
 # Path prefix excluded from risk analysis - CI/CD pipeline config, not application code
 EXCLUDED_PATH_PREFIXES = (".github/",)
+
+VALID_SEVERITIES = ("Critical", "High", "Medium", "Low")
 
 SEVERITY_COLORS = {
     "Critical": {"main": "#7c3aed", "bg": "#f5f3ff", "text": "#6d28d9"},
@@ -86,6 +95,94 @@ def filter_diff_exclude_paths(diff_text: str) -> str:
             continue
         kept.append(section)
     return "".join(kept)
+
+
+def _coerce_severity(value: Any, default: str = "Medium") -> str:
+    if isinstance(value, str):
+        for v in VALID_SEVERITIES:
+            if value.strip().lower() == v.lower():
+                return v
+    return default
+
+
+def _coerce_score(value: Any, default: int = 5) -> Any:
+    try:
+        n = float(value)
+        return int(round(max(0, min(n, 10))))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_analysis(raw: Dict) -> Dict:
+    """
+    Coerce Claude's parsed JSON into the exact shape every renderer expects,
+    regardless of minor deviations from the requested schema (strings
+    instead of objects, missing fields, wrong types, etc.). This is the
+    single choke point where "whatever the model returned" becomes
+    "guaranteed-safe data" - render_html / render_markdown_summary should
+    never need defensive isinstance() checks because of this function.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    data: Dict[str, Any] = {}
+
+    data['overall_score'] = _coerce_score(raw.get('overall_score'), default=5)
+    data['risk_level'] = _coerce_severity(raw.get('risk_level'), default="Medium")
+    data['summary'] = str(raw.get('summary') or "No summary provided.")
+
+    # risk_dimensions: list of dicts expected; tolerate plain strings
+    dims_out = []
+    for d in raw.get('risk_dimensions') or []:
+        if isinstance(d, dict):
+            alert = d.get('alert')
+            if isinstance(alert, dict) and alert.get('text'):
+                alert_out = {
+                    "type": alert.get('type') if alert.get('type') in ('caution', 'warning') else 'warning',
+                    "text": str(alert.get('text')),
+                }
+            else:
+                alert_out = None
+            dims_out.append({
+                "name": str(d.get('name') or "Unnamed change"),
+                "severity_label": _coerce_severity(d.get('severity_label')),
+                "score": _coerce_score(d.get('score')),
+                "description": str(d.get('description') or ""),
+                "alert": alert_out,
+                "tag": str(d['tag']) if d.get('tag') else None,
+            })
+        elif isinstance(d, str) and d.strip():
+            dims_out.append({
+                "name": d, "severity_label": "Medium", "score": 5,
+                "description": "", "alert": None, "tag": None,
+            })
+    data['risk_dimensions'] = dims_out
+
+    # services_affected: list of {name, detail} expected; tolerate plain strings
+    services_out = []
+    for s in raw.get('services_affected') or []:
+        if isinstance(s, dict):
+            name = s.get('name') or s.get('service') or ""
+            if name:
+                services_out.append({"name": str(name), "detail": str(s.get('detail') or "")})
+        elif isinstance(s, str) and s.strip():
+            services_out.append({"name": s, "detail": ""})
+    data['services_affected'] = services_out
+
+    # key_risks: list of plain strings expected; tolerate dicts
+    risks_out = []
+    for r in raw.get('key_risks') or []:
+        if isinstance(r, str) and r.strip():
+            risks_out.append(r)
+        elif isinstance(r, dict):
+            text = r.get('risk') or r.get('description') or r.get('text') or r.get('issue')
+            risks_out.append(str(text) if text else json.dumps(r))
+    data['key_risks'] = risks_out
+
+    data['recommended_window'] = str(raw.get('recommended_window') or "Any business hours")
+    data['rollback_plan_required'] = bool(raw.get('rollback_plan_required', False))
+
+    return data
 
 
 class ReleaseRiskAnalyzer:
@@ -189,7 +286,8 @@ are shown. Do not comment on pipeline or workflow files.
 {context}
 
 Respond with ONLY a single JSON object (no prose, no markdown fences) in
-exactly this shape:
+EXACTLY this shape - every list item MUST be an object with the fields
+shown, never a plain string:
 
 {{
   "overall_score": <integer 0-10>,
@@ -209,7 +307,7 @@ exactly this shape:
     {{"name": "<service/component name>", "detail": "<short clause>"}}
   ],
   "key_risks": [
-    "<one specific, concrete risk statement>"
+    "<one specific, concrete risk statement, as a plain string - NOT an object>"
   ],
   "recommended_window": "<e.g. 'Scheduled maintenance', 'Any business hours', 'Off-peak only'>",
   "rollback_plan_required": true | false
@@ -217,7 +315,8 @@ exactly this shape:
 
 Do not invent categories with no supporting evidence in the diffs. Only set
 rollback_plan_required to true if a dimension involves schema/data changes
-that would be hard to reverse.
+that would be hard to reverse. Every entry in "services_affected" must be an
+object with "name" and "detail" keys - do not return plain strings there.
 """
 
         message = self.claude_client.messages.create(
@@ -229,7 +328,8 @@ that would be hard to reverse.
         json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not json_match:
             raise ValueError(f"Claude did not return parseable JSON:\n{response_text[:500]}")
-        return json.loads(json_match.group())
+        raw = json.loads(json_match.group())
+        return normalize_analysis(raw)
 
 
 def render_html(data: Dict, repo: str, days: int) -> str:
@@ -408,7 +508,8 @@ def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict], s
     if services:
         lines.append("### Services Affected\n")
         for s in services:
-            lines.append(f"- **{s.get('name','')}** ({s.get('detail','')})")
+            detail = f" ({s.get('detail')})" if s.get('detail') else ""
+            lines.append(f"- **{s.get('name','')}**{detail}")
         lines.append("")
 
     risks = data.get('key_risks', [])
@@ -492,6 +593,30 @@ def write_no_analysis_summary(reason: str, skipped_prs: List[Dict]):
         f.write(md)
 
 
+def write_error_summary(error: Exception):
+    """
+    Last-resort safety net: if analysis crashes for any reason (schema
+    surprise we didn't anticipate, network blip, etc.), still leave a
+    Job Summary and the artifact files behind instead of the run going
+    completely silent on the Summary tab, which is what happened before
+    this function existed.
+    """
+    summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+    md = (
+        "### ❌ Release Risk Assessment - Error\n\n"
+        f"The analysis script failed with an unexpected error:\n\n```\n{error}\n```\n\n"
+        "This is a bug in the analysis pipeline itself (not a finding about your code). "
+        "Check the step logs for the full traceback.\n"
+    )
+    if summary_file:
+        with open(summary_file, 'a') as f:
+            f.write(md)
+    with open('release-risk-report.json', 'w') as f:
+        json.dump({"overall_score": None, "risk_level": "Unknown", "error": str(error)}, f, indent=2)
+    with open('release-risk-summary.md', 'w') as f:
+        f.write(md)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repo', required=True)
@@ -501,60 +626,67 @@ def main():
     args = parser.parse_args()
 
     analyzer = ReleaseRiskAnalyzer(args.repo, args.github_token, args.claude_token, args.days)
-    all_prs = analyzer.fetch_prs()
 
-    if not all_prs:
-        reason = f"No PRs merged in the last {args.days} day(s). Nothing to assess."
-        print(f"⚠️  {reason}")
-        write_no_analysis_summary(reason, [])
+    try:
+        all_prs = analyzer.fetch_prs()
+
+        if not all_prs:
+            reason = f"No PRs merged in the last {args.days} day(s). Nothing to assess."
+            print(f"⚠️  {reason}")
+            write_no_analysis_summary(reason, [])
+            sys.exit(0)
+
+        print(f"🔎 Found {len(all_prs)} merged PR(s) - filtering out .github/-only changes...")
+        relevant_prs = analyzer.filter_relevant_prs(all_prs)
+
+        if analyzer.skipped_prs:
+            print(f"⏭️  Skipping {len(analyzer.skipped_prs)} PR(s) that only touched .github/:")
+            for pr in analyzer.skipped_prs:
+                print(f"    - #{pr['number']}: {pr['title']}")
+
+        if not relevant_prs:
+            reason = (
+                f"{len(all_prs)} PR(s) merged in the last {args.days} day(s), but all of them only touched "
+                f".github/ (pipeline config) - nothing else to assess."
+            )
+            print(f"⚠️  {reason}")
+            write_no_analysis_summary(reason, analyzer.skipped_prs)
+            sys.exit(0)
+
+        print(f"📊 Assessing {len(relevant_prs)} merged PR(s) as one release (excluding .github/)...")
+        data = analyzer.analyze(relevant_prs)
+
+        with open('release-risk-report.json', 'w') as f:
+            json.dump(data, f, indent=2)
+
+        html = render_html(data, args.repo, args.days)
+        with open('release-risk-card.html', 'w') as f:
+            f.write(html)
+
+        render_png(html, 'release-risk-card.png')
+
+        markdown_summary = render_markdown_summary(data, args.repo, args.days, relevant_prs, analyzer.skipped_prs)
+        with open('release-risk-summary.md', 'w') as f:
+            f.write(markdown_summary)
+
+        write_step_summary('release-risk-card.png', markdown_summary)
+
+        print(json.dumps(
+            {'overall_score': data.get('overall_score'), 'risk_level': data.get('risk_level')},
+            indent=2
+        ))
+
+        if data.get('risk_level') == FAIL_ON_LEVEL:
+            print(f"❌ Release risk level is {FAIL_ON_LEVEL.upper()} - failing pipeline")
+            sys.exit(1)
+
+        print("✅ Release risk within acceptable limits")
         sys.exit(0)
 
-    print(f"🔎 Found {len(all_prs)} merged PR(s) - filtering out .github/-only changes...")
-    relevant_prs = analyzer.filter_relevant_prs(all_prs)
-
-    if analyzer.skipped_prs:
-        print(f"⏭️  Skipping {len(analyzer.skipped_prs)} PR(s) that only touched .github/:")
-        for pr in analyzer.skipped_prs:
-            print(f"    - #{pr['number']}: {pr['title']}")
-
-    if not relevant_prs:
-        reason = (
-            f"{len(all_prs)} PR(s) merged in the last {args.days} day(s), but all of them only touched "
-            f".github/ (pipeline config) - nothing else to assess."
-        )
-        print(f"⚠️  {reason}")
-        write_no_analysis_summary(reason, analyzer.skipped_prs)
-        sys.exit(0)
-
-    print(f"📊 Assessing {len(relevant_prs)} merged PR(s) as one release (excluding .github/)...")
-    data = analyzer.analyze(relevant_prs)
-
-    with open('release-risk-report.json', 'w') as f:
-        json.dump(data, f, indent=2)
-
-    html = render_html(data, args.repo, args.days)
-    with open('release-risk-card.html', 'w') as f:
-        f.write(html)
-
-    render_png(html, 'release-risk-card.png')
-
-    markdown_summary = render_markdown_summary(data, args.repo, args.days, relevant_prs, analyzer.skipped_prs)
-    with open('release-risk-summary.md', 'w') as f:
-        f.write(markdown_summary)
-
-    write_step_summary('release-risk-card.png', markdown_summary)
-
-    print(json.dumps(
-        {'overall_score': data.get('overall_score'), 'risk_level': data.get('risk_level')},
-        indent=2
-    ))
-
-    if data.get('risk_level') == FAIL_ON_LEVEL:
-        print(f"❌ Release risk level is {FAIL_ON_LEVEL.upper()} - failing pipeline")
-        sys.exit(1)
-
-    print("✅ Release risk within acceptable limits")
-    sys.exit(0)
+    except Exception as e:
+        print(f"❌ Unexpected error during release risk analysis: {e}")
+        write_error_summary(e)
+        raise
 
 
 if __name__ == '__main__':
