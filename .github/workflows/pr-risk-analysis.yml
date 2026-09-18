@@ -25,13 +25,11 @@ jobs:
       - name: Check if branch created from main
         id: check-main
         run: |
-          # Get the merge base to determine if this is a new branch from main
           git fetch origin main
           MERGE_BASE=$(git merge-base origin/main ${{ github.sha }})
           echo "Merge base: $MERGE_BASE"
           echo "Current commit: ${{ github.sha }}"
 
-          # If merge base equals current commit, it's a new branch from main
           if [ "$MERGE_BASE" == "${{ github.sha }}" ]; then
             echo "is_new_from_main=true" >> $GITHUB_OUTPUT
             echo "✅ Branch is new from main - running risk analysis"

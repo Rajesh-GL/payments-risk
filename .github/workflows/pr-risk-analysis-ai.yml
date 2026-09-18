@@ -48,6 +48,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify required secrets are set
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set. Add it under Settings > Secrets and variables > Actions before this workflow can run."
+            exit 1
+          fi
+          echo "✅ ANTHROPIC_API_KEY is present"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -123,11 +131,3 @@ jobs:
         run: |
           echo "❌ Critical risks detected - build failed"
           exit 1
-
-      - name: AI Cost Tracking (Optional)
-        if: always()
-        run: |
-          echo "📊 AI API Usage Report"
-          echo "Model: Claude 3.5 Sonnet"
-          echo "Estimated cost: ~$0.01-0.05 per PR analyzed"
-          echo "See 'pr-risk-report-ai.json' for full details"
