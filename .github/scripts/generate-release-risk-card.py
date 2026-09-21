@@ -22,12 +22,16 @@ analysis - this pipeline's own maintenance commits shouldn't be scored as
 "release risk" alongside real application changes. A PR that touches ONLY
 .github/ files is skipped entirely and listed separately in the report.
 
-Robustness: Claude is asked for a specific JSON schema, but LLM output is
-not guaranteed to match it exactly every time (e.g. it may return a list
-of plain strings where a list of {name, detail} objects was asked for).
-normalize_analysis() coerces whatever comes back into the expected shape
-immediately after parsing, so a minor schema deviation degrades gracefully
-instead of crashing the whole job deep inside HTML rendering.
+Robustness: earlier versions asked Claude to reply with JSON embedded in a
+free-text message and extracted it with a regex + json.loads(). That broke
+twice in practice: once because a field came back as the wrong type (a
+string where an object was expected), and once because the free-text JSON
+itself was syntactically invalid (an unescaped character inside a string
+value broke the parse). This version uses Claude's tool-use (function
+calling) feature instead - the API itself parses and returns structured
+input matching a JSON Schema, so there is no free-text JSON to regex out
+or that can come back syntactically malformed. normalize_analysis() still
+runs as a second line of defense against schema-shape surprises.
 """
 
 import os
@@ -70,8 +74,59 @@ SEVERITY_EMOJI = {
     "Low": "🟢",
 }
 
-# The risk level at/above which the pipeline should fail
 FAIL_ON_LEVEL = "Critical"
+
+# JSON Schema for Claude's tool-use response. The API validates the model's
+# output against this before it ever reaches our code, which is what
+# eliminates both the "wrong type" and "malformed JSON" failure modes seen
+# with free-text JSON extraction.
+RISK_ASSESSMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overall_score": {"type": "integer", "minimum": 0, "maximum": 10},
+        "risk_level": {"type": "string", "enum": list(VALID_SEVERITIES)},
+        "summary": {"type": "string"},
+        "risk_dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "severity_label": {"type": "string", "enum": list(VALID_SEVERITIES)},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 10},
+                    "description": {"type": "string"},
+                    "alert": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["caution", "warning"]},
+                            "text": {"type": "string"},
+                        },
+                    },
+                    "tag": {"type": ["string", "null"]},
+                },
+                "required": ["name", "severity_label", "score", "description"],
+            },
+        },
+        "services_affected": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+        "key_risks": {"type": "array", "items": {"type": "string"}},
+        "recommended_window": {"type": "string"},
+        "rollback_plan_required": {"type": "boolean"},
+    },
+    "required": [
+        "overall_score", "risk_level", "summary", "risk_dimensions",
+        "services_affected", "key_risks", "recommended_window", "rollback_plan_required",
+    ],
+}
 
 
 def is_excluded_path(filename: str) -> bool:
@@ -115,12 +170,9 @@ def _coerce_score(value: Any, default: int = 5) -> Any:
 
 def normalize_analysis(raw: Dict) -> Dict:
     """
-    Coerce Claude's parsed JSON into the exact shape every renderer expects,
-    regardless of minor deviations from the requested schema (strings
-    instead of objects, missing fields, wrong types, etc.). This is the
-    single choke point where "whatever the model returned" becomes
-    "guaranteed-safe data" - render_html / render_markdown_summary should
-    never need defensive isinstance() checks because of this function.
+    Second line of defense: even though tool-use output is schema-validated
+    by the API, still coerce field types defensively before rendering, in
+    case of enum/type edge cases the schema didn't fully pin down.
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -131,7 +183,6 @@ def normalize_analysis(raw: Dict) -> Dict:
     data['risk_level'] = _coerce_severity(raw.get('risk_level'), default="Medium")
     data['summary'] = str(raw.get('summary') or "No summary provided.")
 
-    # risk_dimensions: list of dicts expected; tolerate plain strings
     dims_out = []
     for d in raw.get('risk_dimensions') or []:
         if isinstance(d, dict):
@@ -158,7 +209,6 @@ def normalize_analysis(raw: Dict) -> Dict:
             })
     data['risk_dimensions'] = dims_out
 
-    # services_affected: list of {name, detail} expected; tolerate plain strings
     services_out = []
     for s in raw.get('services_affected') or []:
         if isinstance(s, dict):
@@ -169,7 +219,6 @@ def normalize_analysis(raw: Dict) -> Dict:
             services_out.append({"name": s, "detail": ""})
     data['services_affected'] = services_out
 
-    # key_risks: list of plain strings expected; tolerate dicts
     risks_out = []
     for r in raw.get('key_risks') or []:
         if isinstance(r, str) and r.strip():
@@ -197,7 +246,7 @@ class ReleaseRiskAnalyzer:
         self.days = days
         self.max_prs = max_prs
         self.date_from = datetime.now() - timedelta(days=days)
-        self.skipped_prs: List[Dict] = []  # PRs excluded for touching ONLY .github/
+        self.skipped_prs: List[Dict] = []
 
     def fetch_prs(self) -> List[Dict]:
         date_from_str = self.date_from.isoformat().split('T')[0]
@@ -234,11 +283,6 @@ class ReleaseRiskAnalyzer:
             return f"(could not fetch diff: {e})"
 
     def filter_relevant_prs(self, prs: List[Dict]) -> List[Dict]:
-        """
-        Split PRs into ones with at least one non-excluded file change
-        (kept for analysis) and ones that ONLY touched excluded paths
-        like .github/ (recorded in self.skipped_prs, shown separately).
-        """
         relevant = []
         self.skipped_prs = []
         for pr in prs:
@@ -285,50 +329,32 @@ are shown. Do not comment on pipeline or workflow files.
 
 {context}
 
-Respond with ONLY a single JSON object (no prose, no markdown fences) in
-EXACTLY this shape - every list item MUST be an object with the fields
-shown, never a plain string:
-
-{{
-  "overall_score": <integer 0-10>,
-  "risk_level": "Critical" | "High" | "Medium" | "Low",
-  "summary": "<2-4 sentence plain-English summary referencing the specific changes>",
-  "risk_dimensions": [
-    {{
-      "name": "<short dimension name relevant to the ACTUAL diffs, e.g. 'Schema Changes', 'Calculation Engine Changes', 'Auth & Permissions Changes', 'Data Migration' - only include dimensions with real supporting evidence>",
-      "severity_label": "Critical" | "High" | "Medium" | "Low",
-      "score": <integer 0-10>,
-      "description": "<2-4 sentences of specific technical detail, referencing real file/function/table names from the diff>",
-      "alert": {{"type": "caution", "text": "<short line>"}} or {{"type": "warning", "text": "<short line>"}} or null,
-      "tag": "<optional short label like 'Impact: Core calculation'>" or null
-    }}
-  ],
-  "services_affected": [
-    {{"name": "<service/component name>", "detail": "<short clause>"}}
-  ],
-  "key_risks": [
-    "<one specific, concrete risk statement, as a plain string - NOT an object>"
-  ],
-  "recommended_window": "<e.g. 'Scheduled maintenance', 'Any business hours', 'Off-peak only'>",
-  "rollback_plan_required": true | false
-}}
-
-Do not invent categories with no supporting evidence in the diffs. Only set
-rollback_plan_required to true if a dimension involves schema/data changes
-that would be hard to reverse. Every entry in "services_affected" must be an
-object with "name" and "detail" keys - do not return plain strings there.
+Call the submit_release_risk_assessment tool with your findings. Do not
+invent risk dimensions with no supporting evidence in the diffs above.
+Only set rollback_plan_required to true if a dimension involves schema or
+data changes that would be hard to reverse.
 """
 
         message = self.claude_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=3000,
+            tools=[{
+                "name": "submit_release_risk_assessment",
+                "description": "Submit the structured release risk assessment for this batch of PRs.",
+                "input_schema": RISK_ASSESSMENT_SCHEMA,
+            }],
+            tool_choice={"type": "tool", "name": "submit_release_risk_assessment"},
             messages=[{"role": "user", "content": prompt}],
         )
-        response_text = message.content[0].text
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not json_match:
-            raise ValueError(f"Claude did not return parseable JSON:\n{response_text[:500]}")
-        raw = json.loads(json_match.group())
+
+        tool_use_block = next((b for b in message.content if getattr(b, "type", None) == "tool_use"), None)
+        if tool_use_block is None:
+            raise ValueError(
+                "Claude did not return a tool_use block with the risk assessment. "
+                f"stop_reason={message.stop_reason!r}"
+            )
+
+        raw = tool_use_block.input  # already a parsed dict - no JSON string to extract/parse
         return normalize_analysis(raw)
 
 
@@ -465,12 +491,6 @@ def render_png(html: str, output_path: str):
 
 
 def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict], skipped_prs: List[Dict]) -> str:
-    """
-    Plain-text/Markdown companion to the PNG card - covers what an image
-    can't: full-text search, screen readers, and a clean diff between runs.
-    Uses GitHub's native alert syntax (rendered with colored borders/icons
-    by the Job Summary renderer) instead of custom HTML.
-    """
     level = data.get('risk_level', 'Medium')
     score = data.get('overall_score', 'N/A')
     emoji = SEVERITY_EMOJI.get(level, '⚪')
@@ -569,7 +589,6 @@ def write_step_summary(png_path: str, markdown_summary: str):
 
 
 def write_no_analysis_summary(reason: str, skipped_prs: List[Dict]):
-    """Used when there's nothing left to analyze after excluding .github/-only PRs."""
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     lines = [
         "### Release Risk Assessment\n",
@@ -594,13 +613,6 @@ def write_no_analysis_summary(reason: str, skipped_prs: List[Dict]):
 
 
 def write_error_summary(error: Exception):
-    """
-    Last-resort safety net: if analysis crashes for any reason (schema
-    surprise we didn't anticipate, network blip, etc.), still leave a
-    Job Summary and the artifact files behind instead of the run going
-    completely silent on the Summary tab, which is what happened before
-    this function existed.
-    """
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     md = (
         "### ❌ Release Risk Assessment - Error\n\n"
