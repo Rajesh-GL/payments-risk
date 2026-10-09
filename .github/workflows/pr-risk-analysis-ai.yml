@@ -40,7 +40,7 @@ jobs:
     needs: check-branch-source
     runs-on: ubuntu-latest
     if: needs.check-branch-source.outputs.is_new_from_main == 'true'
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -74,7 +74,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANALYSIS_DAYS: 15
+          ANALYSIS_DAYS: 30
         run: |
           python .github/scripts/generate-release-risk-card.py \
             --repo "${{ github.repository }}" \

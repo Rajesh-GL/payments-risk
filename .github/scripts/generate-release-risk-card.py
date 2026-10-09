@@ -235,7 +235,7 @@ def normalize_analysis(raw: Dict) -> Dict:
 
 
 class ReleaseRiskAnalyzer:
-    def __init__(self, repo: str, github_token: str, claude_api_key: str, days: int = 7, max_prs: int = 15):
+    def __init__(self, repo: str, github_token: str, claude_api_key: str, days: int = 7, max_prs: int = 30):
         self.repo = repo
         self.github_headers = {
             "Authorization": f"token {github_token}",
