@@ -32,6 +32,9 @@ calling) feature instead - the API itself parses and returns structured
 input matching a JSON Schema, so there is no free-text JSON to regex out
 or that can come back syntactically malformed. normalize_analysis() still
 runs as a second line of defense against schema-shape surprises.
+
+Gate: the pipeline fails when the assessed risk_level is Critical OR High
+(see FAIL_ON_LEVELS below) - only Medium/Low pass without review.
 """
 
 import os
@@ -74,7 +77,10 @@ SEVERITY_EMOJI = {
     "Low": "🟢",
 }
 
-FAIL_ON_LEVEL = "Critical"
+# The pipeline fails when risk_level is any of these. Previously only
+# ("Critical",) - now also includes "High" per explicit request, so only
+# Medium/Low pass without triggering the gate.
+FAIL_ON_LEVELS = ("Critical", "High")
 
 # JSON Schema for Claude's tool-use response. The API validates the model's
 # output against this before it ever reaches our code, which is what
@@ -560,14 +566,15 @@ def render_markdown_summary(data: Dict, repo: str, days: int, prs: List[Dict], s
         lines.append("")
 
     lines.append("---\n")
-    if level == FAIL_ON_LEVEL:
+    threshold_label = " or ".join(FAIL_ON_LEVELS)
+    if level in FAIL_ON_LEVELS:
         lines.append(f"### ❌ Final Verdict: FAIL\n")
-        lines.append(f"Risk level **{level}** meets or exceeds the fail threshold (`{FAIL_ON_LEVEL}`). "
+        lines.append(f"Risk level **{level}** meets the fail threshold (`{threshold_label}`). "
                       f"This pipeline run has been marked as failed - review the risk dimensions above before proceeding.\n")
     else:
         lines.append(f"### ✅ Final Verdict: PASS\n")
-        lines.append(f"Risk level **{level}** is below the fail threshold (`{FAIL_ON_LEVEL}`). "
-                      f"No pipeline gate was triggered, but review any High/Medium items above as appropriate.\n")
+        lines.append(f"Risk level **{level}** is below the fail threshold (`{threshold_label}`). "
+                      f"No pipeline gate was triggered, but review any Medium items above as appropriate.\n")
 
     return "\n".join(lines)
 
@@ -688,11 +695,12 @@ def main():
             indent=2
         ))
 
-        if data.get('risk_level') == FAIL_ON_LEVEL:
-            print(f"❌ Release risk level is {FAIL_ON_LEVEL.upper()} - failing pipeline")
+        risk_level = data.get('risk_level')
+        if risk_level in FAIL_ON_LEVELS:
+            print(f"❌ Release risk level is {risk_level.upper()} (fail threshold: {', '.join(FAIL_ON_LEVELS)}) - failing pipeline")
             sys.exit(1)
 
-        print("✅ Release risk within acceptable limits")
+        print(f"✅ Release risk level is {risk_level} - within acceptable limits")
         sys.exit(0)
 
     except Exception as e:
